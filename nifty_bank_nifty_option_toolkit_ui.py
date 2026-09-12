@@ -10,12 +10,11 @@ from streamlit_autorefresh import st_autorefresh
 st.set_page_config(page_title="Options Toolkit", layout="wide")
 st.header('NIFTY and BANKNIFTY Options Toolkit', divider='rainbow')
 
-# FIXED: Standard mathematical rounding to find the true nearest ATM strike
 def round_nearest(x, num=50): return int(round(float(x)/num)*num)
 def nearest_strike_bnf(x): return round_nearest(x, 100)
 def nearest_strike_nf(x): return round_nearest(x, 50)
 
-# Browser Headers to mimic a real user and bypass blocks
+# Browser Headers to mimic a real user
 headers = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'application/json,text/plain,*/*',
@@ -24,29 +23,38 @@ headers = {
     'Connection': 'keep-alive'
 }
 
-# Fetch Data: Reverted to the reliable 'option-chain-indices' endpoint
+# Fetch Data: Upgraded to modern V3 endpoint
 @st.cache_data(ttl=60)
 def fetch_nse_data(symbol="NIFTY"):
     session = requests.Session()
     try:
         # Establish session cookies
         session.get("https://www.nseindia.com", headers=headers, timeout=8)
+        session.get("https://www.nseindia.com/option-chain", headers=headers, timeout=8)
         
-        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
-        chain_res = session.get(url, headers=headers, timeout=8)
+        # Step 1: Get Contract Info to find the exact Expiry Date
+        c_res = session.get(f"https://www.nseindia.com/api/option-chain-contract-info?symbol={symbol}", headers=headers, timeout=8)
+        c_res.raise_for_status()
+        expiries = c_res.json().get("expiryDates", [])
         
-        # Retry once if NSE throws an unauthorized session error
-        if chain_res.status_code == 401:
-            session.get("https://www.nseindia.com", headers=headers, timeout=8)
-            chain_res = session.get(url, headers=headers, timeout=8)
+        if not expiries: 
+            return None
             
+        # Step 2: Use the V3 endpoint to fetch only the data for the nearest expiry
+        current_expiry = expiries[0]
+        chain_url = f"https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol={symbol}&expiry={current_expiry}"
+        chain_res = session.get(chain_url, headers=headers, timeout=8)
         chain_res.raise_for_status()
-        return chain_res.json()
+        
+        data = chain_res.json()
+        # Inject the expiry date into the dictionary so the UI can display it
+        data['currentExpiry'] = current_expiry 
+        return data
+        
     except Exception as e:
         print(f"Fetch Error ({symbol}): {e}")
         return None
 
-# Extract underlying spot price
 def get_spot_price(data):
     if not data: return 0.0
     spot = float(data.get('records', {}).get('underlyingValue', 0.0))
@@ -60,15 +68,13 @@ def get_spot_price(data):
 def get_io(step, nearest, data):
     try:
         if not data: return []
-        currExpiryDate = data["records"]["expiryDates"][0]
-        
         target_strikes = [nearest - step, nearest, nearest + step]
         data_list = []
         
+        # We no longer filter by 'expiryDate' because V3 only returns the requested expiry
         for item in data['records']['data']:
-            if item.get("expiryDate") == currExpiryDate and item["strikePrice"] in target_strikes:
+            if item["strikePrice"] in target_strikes:
                 data_list.append({
-                    'expiry': str(currExpiryDate),
                     'strike': item["strikePrice"],
                     'ce_ltp': item.get("CE", {}).get("lastPrice", 0),
                     'ce_change': round(item.get("CE", {}).get("change", 0), 2),
@@ -84,19 +90,16 @@ def get_io(step, nearest, data):
 def oi_plot(num, step, nearest, data):
     try:
         if not data: return pd.DataFrame()
-        currExpiryDate = data["records"]["expiryDates"][0]
-        
         min_strike = nearest - (step * num)
         max_strike = nearest + (step * num)
         
         ce_oi_list, pe_oi_list, oi_strike_list = [], [], []
         
         for item in data['records']['data']:
-            if item.get("expiryDate") == currExpiryDate:
-                if min_strike <= item["strikePrice"] <= max_strike:
-                    pe_oi_list.append(item.get("PE", {}).get("openInterest", 0))
-                    ce_oi_list.append(item.get("CE", {}).get("openInterest", 0))
-                    oi_strike_list.append(item["strikePrice"])
+            if min_strike <= item["strikePrice"] <= max_strike:
+                pe_oi_list.append(item.get("PE", {}).get("openInterest", 0))
+                ce_oi_list.append(item.get("CE", {}).get("openInterest", 0))
+                oi_strike_list.append(item["strikePrice"])
 
         df = pd.DataFrame({
             "CE_OI": ce_oi_list,
@@ -114,19 +117,16 @@ def oi_plot(num, step, nearest, data):
 def highest_oi(num, step, nearest, data, option_type="CE"):
     try:
         if not data: return nearest
-        currExpiryDate = data["records"]["expiryDates"][0]
-        
         min_strike = nearest - (step * num)
         max_strike = nearest + (step * num)
         max_oi, max_oi_strike = 0, nearest
         
         for item in data['records']['data']:
-            if item.get("expiryDate") == currExpiryDate:
-                if min_strike <= item["strikePrice"] <= max_strike:
-                    current_oi = item.get(option_type, {}).get("openInterest", 0)
-                    if current_oi > max_oi:
-                        max_oi = current_oi
-                        max_oi_strike = item["strikePrice"]
+            if min_strike <= item["strikePrice"] <= max_strike:
+                current_oi = item.get(option_type, {}).get("openInterest", 0)
+                if current_oi > max_oi:
+                    max_oi = current_oi
+                    max_oi_strike = item["strikePrice"]
         return max_oi_strike
     except Exception as e:
         print(f"Error in highest_oi_{option_type}: {e}")
@@ -150,6 +150,7 @@ if __name__ == "__main__":
     nf_highestoi_CE = highest_oi(15, 50, nf_nearest, nifty_data, "CE") 
     nf_highestoi_PE = highest_oi(15, 50, nf_nearest, nifty_data, "PE")
     nifty_chart_data = oi_plot(20, 50, nf_nearest, nifty_data) 
+    nf_exp = nifty_data.get('currentExpiry', 'Unknown')
 
     # Process BANKNIFTY
     bnf_ul = get_spot_price(bank_nifty_data)
@@ -158,6 +159,7 @@ if __name__ == "__main__":
     bnf_highestoi_CE = highest_oi(20, 100, bnf_nearest, bank_nifty_data, "CE")
     bnf_highestoi_PE = highest_oi(20, 100, bnf_nearest, bank_nifty_data, "PE")
     bank_nifty_chart_data = oi_plot(20, 100, bnf_nearest, bank_nifty_data)
+    bnf_exp = bank_nifty_data.get('currentExpiry', 'Unknown')
 
     # ==========================================
     # NIFTY UI RENDERING
@@ -165,9 +167,8 @@ if __name__ == "__main__":
     st.metric("NIFTY 50 Index", f"{nf_ul:,.2f}")
     
     if nifty_oi_data:
-        st.write(f"NIFTY Exp-{nifty_oi_data[0]['expiry']} :blue[LTP {str(nf_ul)}], :gray[CE[ ATM:{str(nf_nearest)},ITM:{str(nf_nearest-50)},OTM:{str(nf_nearest+50)}]], :gray[PE[ ATM:{str(nf_nearest)}, ITM:{str(nf_nearest+50)}, OTM:{str(nf_nearest-50)}]], :green[OI_SUP {str(nf_highestoi_PE)}] :red[OI_RES {str(nf_highestoi_CE)}]")
+        st.write(f"NIFTY Exp-{nf_exp} :blue[LTP {str(nf_ul)}], :gray[CE[ ATM:{str(nf_nearest)},ITM:{str(nf_nearest-50)},OTM:{str(nf_nearest+50)}]], :gray[PE[ ATM:{str(nf_nearest)}, ITM:{str(nf_nearest+50)}, OTM:{str(nf_nearest-50)}]], :green[OI_SUP {str(nf_highestoi_PE)}] :red[OI_RES {str(nf_highestoi_CE)}]")
         
-        # FIXED: Dynamic column rendering so it never crashes if strikes are missing
         cols = st.columns(6)
         col_idx = 0
         with st.container():
@@ -188,9 +189,8 @@ if __name__ == "__main__":
     st.metric("NIFTY BANK Index", f"{bnf_ul:,.2f}")
     
     if bank_nifty_oi_data:
-        st.write(f"BANKNIFTY Exp-{bank_nifty_oi_data[0]['expiry']} :blue[LTP {str(bnf_ul)}] , :gray[ CE[ATM: {str(bnf_nearest)},ITM:{str(bnf_nearest-100)},OTM:{str(bnf_nearest+100)}]], :gray[PE[ ATM:{str(bnf_nearest)}, ITM:{str(bnf_nearest+100)}, OTM:{str(bnf_nearest-100)}]], :green[OI_SUP {str(bnf_highestoi_PE)}],  :red[OI_RES {str(bnf_highestoi_CE)}]")
+        st.write(f"BANKNIFTY Exp-{bnf_exp} :blue[LTP {str(bnf_ul)}] , :gray[ CE[ATM: {str(bnf_nearest)},ITM:{str(bnf_nearest-100)},OTM:{str(bnf_nearest+100)}]], :gray[PE[ ATM:{str(bnf_nearest)}, ITM:{str(bnf_nearest+100)}, OTM:{str(bnf_nearest-100)}]], :green[OI_SUP {str(bnf_highestoi_PE)}],  :red[OI_RES {str(bnf_highestoi_CE)}]")
         
-        # FIXED: Dynamic column rendering
         bnf_cols = st.columns(6)
         bnf_col_idx = 0
         with st.container():
