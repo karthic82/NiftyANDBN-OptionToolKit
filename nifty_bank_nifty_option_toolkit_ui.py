@@ -2,7 +2,6 @@
 import streamlit as st
 import pandas as pd
 import requests
-import json
 import math
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
@@ -10,12 +9,6 @@ from streamlit_autorefresh import st_autorefresh
 # Page wide mode
 st.set_page_config(page_title="Options Toolkit", layout="wide")
 st.header('NIFTY and BANKNIFTY Options Toolkit', divider='rainbow')
-
-# FORMATTING CONSOLE DISPLAY colored text and background
-def strRed(skk):         return "\033[91m {}\033[00m".format(skk)
-def strGreen(skk):       return "\033[92m {}\033[00m".format(skk)
-def strPurple(skk):      return "\033[95m {}\033[00m".format(skk)
-def strBold(skk):        return "\033[1m {}\033[0m".format(skk)
 
 # Method to get nearest strikes
 def round_nearest(x, num=50): return int(math.ceil(float(x)/num)*num)
@@ -31,16 +24,14 @@ headers = {
     'Connection': 'keep-alive'
 }
 
-# Fetch Data with Streamlit Caching (ttl=60s prevents spamming the NSE server)
+# Fetch Data with Streamlit Caching
 @st.cache_data(ttl=60)
 def fetch_nse_data(symbol="NIFTY"):
     session = requests.Session()
     try:
-        # Initial ping to establish cookies
         session.get("https://www.nseindia.com", headers=headers, timeout=8)
         session.get("https://www.nseindia.com/option-chain", headers=headers, timeout=8)
         
-        # Get expiry dates
         c_res = session.get(f"https://www.nseindia.com/api/option-chain-contract-info?symbol={symbol}", headers=headers, timeout=8)
         c_res.raise_for_status()
         expiries = c_res.json().get("expiryDates", [])
@@ -48,7 +39,6 @@ def fetch_nse_data(symbol="NIFTY"):
         if not expiries: 
             return None
             
-        # Fetch the actual option chain for the nearest expiry
         chain_res = session.get(f"https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol={symbol}&expiry={expiries[0]}", headers=headers, timeout=8)
         chain_res.raise_for_status()
         return chain_res.json()
@@ -56,7 +46,7 @@ def fetch_nse_data(symbol="NIFTY"):
         print(f"Fetch Error ({symbol}): {e}")
         return None
 
-# Extract underlying spot price directly from the chain data
+# Extract underlying spot price
 def get_spot_price(data):
     if not data: return 0.0
     spot = float(data.get('records', {}).get('underlyingValue', 0.0))
@@ -67,76 +57,82 @@ def get_spot_price(data):
                     return float(row.get(leg).get("underlyingValue"))
     return spot
 
-# Get the OI data as dictionary for the specific strikes
+# 1. FIXED: Explicit target targeting instead of sequential counting
 def get_io(num, step, nearest, data):
     try:
         if not data: return []
-        strike = nearest - (step * num)
-        start_strike = nearest - (step * num)
-        data_list = []
         currExpiryDate = data["records"]["expiryDates"][0]
         
+        # We explicitly define the 3 strikes we want for the UI (ITM, ATM, OTM)
+        target_strikes = [nearest - step, nearest, nearest + step]
+        data_list = []
+        
         for item in data['records']['data']:
-            if item.get("expiryDate") == currExpiryDate:
-                if item["strikePrice"] == strike and item["strikePrice"] < start_strike + (step * num * 2):
-                    if item["strikePrice"] in (nearest - step, nearest, nearest + step):
-                        data_list.append({
-                            'expiry': str(currExpiryDate),
-                            'strike': item["strikePrice"],
-                            'ce_ltp': item.get("CE", {}).get("lastPrice", 0),
-                            'ce_change': round(item.get("CE", {}).get("change", 0), 2),
-                            'pe_ltp': item.get("PE", {}).get("lastPrice", 0),
-                            'pe_change': round(item.get("PE", {}).get("change", 0), 2)
-                        })
-                    strike += step
-        return data_list
+            if item.get("expiryDate") == currExpiryDate and item["strikePrice"] in target_strikes:
+                data_list.append({
+                    'expiry': str(currExpiryDate),
+                    'strike': item["strikePrice"],
+                    'ce_ltp': item.get("CE", {}).get("lastPrice", 0),
+                    'ce_change': round(item.get("CE", {}).get("change", 0), 2),
+                    'pe_ltp': item.get("PE", {}).get("lastPrice", 0),
+                    'pe_change': round(item.get("PE", {}).get("change", 0), 2)
+                })
+        
+        # Sort ascending by strike so index 0, 1, 2 map correctly to the UI columns
+        return sorted(data_list, key=lambda x: x['strike'])
     except Exception as e:
         print(f"Error in get_io: {e}")
         return []
 
-# OI Plot function
+# 2. FIXED: Range-based filtering for the chart
 def oi_plot(num, step, nearest, data):
     try:
         if not data: return pd.DataFrame()
-        strike = nearest - (step * num)
-        start_strike = nearest - (step * num)
         currExpiryDate = data["records"]["expiryDates"][0]
+        
+        # Define the boundary of the chart
+        min_strike = nearest - (step * num)
+        max_strike = nearest + (step * num)
+        
         ce_oi_list, pe_oi_list, oi_strike_list = [], [], []
         
         for item in data['records']['data']:
             if item.get("expiryDate") == currExpiryDate:
-                if item["strikePrice"] == strike and item["strikePrice"] < start_strike + (step * num * 2):
+                if min_strike <= item["strikePrice"] <= max_strike:
                     pe_oi_list.append(item.get("PE", {}).get("openInterest", 0))
                     ce_oi_list.append(item.get("CE", {}).get("openInterest", 0))
                     oi_strike_list.append(item["strikePrice"])
-                    strike += step
 
-        return pd.DataFrame({
+        df = pd.DataFrame({
             "CE_OI": ce_oi_list,
             "PE_OI": pe_oi_list,
             "Strike": oi_strike_list,
         })
+        
+        if not df.empty:
+            df = df.sort_values('Strike').reset_index(drop=True)
+        return df
     except Exception as e:
         print(f"Error in oi_plot: {e}")
         return pd.DataFrame()
 
-# Finding highest Open Interest
+# 3. FIXED: Range-based filtering for Support/Resistance levels
 def highest_oi(num, step, nearest, data, option_type="CE"):
     try:
         if not data: return nearest
-        strike = nearest - (step * num)
-        start_strike = nearest - (step * num)
         currExpiryDate = data["records"]["expiryDates"][0]
+        
+        min_strike = nearest - (step * num)
+        max_strike = nearest + (step * num)
         max_oi, max_oi_strike = 0, nearest
         
         for item in data['records']['data']:
             if item.get("expiryDate") == currExpiryDate:
-                if item["strikePrice"] == strike and item["strikePrice"] < start_strike + (step * num * 2):
+                if min_strike <= item["strikePrice"] <= max_strike:
                     current_oi = item.get(option_type, {}).get("openInterest", 0)
                     if current_oi > max_oi:
                         max_oi = current_oi
                         max_oi_strike = item["strikePrice"]
-                    strike += step
         return max_oi_strike
     except Exception as e:
         print(f"Error in highest_oi_{option_type}: {e}")
@@ -144,10 +140,8 @@ def highest_oi(num, step, nearest, data, option_type="CE"):
 
 if __name__ == "__main__":
     
-    # Run the autorefresh about every 30000 milliseconds (30 seconds)
     count = st_autorefresh(interval=30000, limit=10000, key="mycounter")
     
-    # 1. Fetch data for both indices
     nifty_data = fetch_nse_data("NIFTY")
     bank_nifty_data = fetch_nse_data("BANKNIFTY")
 
@@ -155,27 +149,25 @@ if __name__ == "__main__":
         st.warning("⚠️ NSE Data is currently unavailable or rate-limited. Retrying on next refresh...")
         st.stop()
 
-    # 2. Process NIFTY Data
+    # Process NIFTY
     nf_ul = get_spot_price(nifty_data)
     nf_nearest = nearest_strike_nf(nf_ul)
-    
     nifty_oi_data = get_io(2, 50, nf_nearest, nifty_data)
-    nf_highestoi_CE = highest_oi(10, 50, nf_nearest, nifty_data, "CE")
-    nf_highestoi_PE = highest_oi(10, 50, nf_nearest, nifty_data, "PE")
-    nifty_chart_data = oi_plot(5, 50, nf_nearest, nifty_data)
+    nf_highestoi_CE = highest_oi(15, 50, nf_nearest, nifty_data, "CE") 
+    nf_highestoi_PE = highest_oi(15, 50, nf_nearest, nifty_data, "PE")
+    # Increased 'num' from 5 to 20 here so your bar chart shows a wider range of strikes
+    nifty_chart_data = oi_plot(20, 50, nf_nearest, nifty_data) 
 
-    # 3. Process BANKNIFTY Data
+    # Process BANKNIFTY
     bnf_ul = get_spot_price(bank_nifty_data)
     bnf_nearest = nearest_strike_bnf(bnf_ul)
-    
     bank_nifty_oi_data = get_io(2, 100, bnf_nearest, bank_nifty_data)
     bnf_highestoi_CE = highest_oi(20, 100, bnf_nearest, bank_nifty_data, "CE")
     bnf_highestoi_PE = highest_oi(20, 100, bnf_nearest, bank_nifty_data, "PE")
-    bank_nifty_chart_data = oi_plot(10, 100, bnf_nearest, bank_nifty_data)
+    # Increased 'num' from 10 to 20 for a wider chart view
+    bank_nifty_chart_data = oi_plot(20, 100, bnf_nearest, bank_nifty_data)
 
-    # =========================================
-    # NIFTY UI RENDERING
-    # =========================================
+    # --- NIFTY UI RENDERING ---
     st.metric("NIFTY 50 Index", f"{nf_ul:,.2f}")
     
     if len(nifty_oi_data) >= 3:
@@ -196,9 +188,7 @@ if __name__ == "__main__":
         if not nifty_chart_data.empty:
             st.bar_chart(nifty_chart_data, x="Strike", y=["CE_OI", "PE_OI"], color=["#0000FF", "#FF0000"])
 
-    # =========================================
-    # BANKNIFTY UI RENDERING
-    # =========================================
+    # --- BANKNIFTY UI RENDERING ---
     st.metric("NIFTY BANK Index", f"{bnf_ul:,.2f}")
     
     if len(bank_nifty_oi_data) >= 3:
